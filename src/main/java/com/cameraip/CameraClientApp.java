@@ -1,21 +1,56 @@
 package com.cameraip;
 
-import com.formdev.flatlaf.FlatDarkLaf;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.GraphicsDevice;
+import java.awt.GraphicsEnvironment;
+import java.awt.RenderingHints;
+import java.awt.event.ActionListener;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.imageio.ImageIO;
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
+import javax.swing.UIManager;
+import javax.swing.border.EmptyBorder;
+
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 
-import javax.imageio.ImageIO;
-import javax.swing.*;
-import javax.swing.border.EmptyBorder;
-import java.awt.*;
-import java.awt.event.*;
-import java.awt.image.BufferedImage;
-import java.io.*;
-import java.net.URI;
-import java.nio.ByteBuffer;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import com.formdev.flatlaf.FlatDarkLaf;
 
 /**
  * Camera Client Application
@@ -319,15 +354,27 @@ public class CameraClientApp extends JFrame {
 
                 @Override
                 public void onMessage(ByteBuffer bytes) {
-                    // ★ Binary = JPEG frame — decode and display immediately
+                    // ★ Binary = [8-byte timestamp][JPEG data]
                     try {
-                        byte[] data = new byte[bytes.remaining()];
-                        bytes.get(data);
+                        int total = bytes.remaining();
+                        if (total < 10) return; // Too small
 
-                        // ★ Store latest JPEG for vcam (non-blocking)
-                        latestJpegData = data;
+                        // ★ Extract timestamp header (8 bytes, big-endian)
+                        long sendTime = 0;
+                        for (int i = 0; i < 8; i++) {
+                            sendTime = (sendTime << 8) | (bytes.get() & 0xFF);
+                        }
+                        latencyMs = System.currentTimeMillis() - sendTime;
 
-                        BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
+                        // ★ Read JPEG data (remaining bytes)
+                        byte[] jpegData = new byte[bytes.remaining()];
+                        bytes.get(jpegData);
+
+                        // Store for vcam
+                        latestJpegData = jpegData;
+
+                        // ★ Decode and display
+                        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jpegData));
                         if (img != null) {
                             currentFrame = img;
                             frameWidth = img.getWidth();
@@ -337,7 +384,7 @@ public class CameraClientApp extends JFrame {
                             videoPanel.repaint();
 
                             // Update resolution label occasionally
-                            if (fpsCounter.get() % 30 == 1) {
+                            if (fpsCounter.get() % 60 == 1) {
                                 SwingUtilities.invokeLater(() ->
                                         resLabel.setText("Res: " + frameWidth + "x" + frameHeight));
                             }

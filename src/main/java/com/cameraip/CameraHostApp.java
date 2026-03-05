@@ -1,25 +1,55 @@
 package com.cameraip;
 
-import com.formdev.flatlaf.FlatDarkLaf;
-import com.github.sarxos.webcam.Webcam;
-import com.github.sarxos.webcam.WebcamResolution;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.imageio.ImageIO;
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JComboBox;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.JSlider;
+import javax.swing.JTextArea;
+import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
+import javax.swing.UIManager;
+import javax.swing.border.EmptyBorder;
+
 import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
 
-import javax.imageio.ImageIO;
-import javax.swing.*;
-import javax.swing.border.*;
-import java.awt.*;
-import java.awt.event.*;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayOutputStream;
-import java.net.*;
-import java.util.*;
-import java.util.List;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import com.formdev.flatlaf.FlatDarkLaf;
+import com.github.sarxos.webcam.Webcam;
+import com.github.sarxos.webcam.WebcamResolution;
 
 /**
  * Camera Host Application
@@ -48,16 +78,15 @@ public class CameraHostApp extends JFrame {
     private FrameServer wsServer;
     private final AtomicBoolean streaming = new AtomicBoolean(false);
     private ScheduledExecutorService scheduler;
-    private int jpegQuality = 50;  // Lower default = less latency
+    private int jpegQuality = 40;  // ★ Lower = smaller frame = faster transfer
     private int targetFps = 30;
     private final AtomicInteger fpsCounter = new AtomicInteger(0);
     private volatile int displayFps = 0;
     // Reuse encoder for performance
     private javax.imageio.ImageWriter jpegWriter;
     private javax.imageio.ImageWriteParam jpegParam;
-    private final ByteArrayOutputStream jpegBuffer = new ByteArrayOutputStream(64 * 1024);
-    private volatile byte[] latestFrame;  // Latest encoded frame for async broadcast
-    private int previewSkip = 0;  // Skip counter for UI updates
+    private final ByteArrayOutputStream jpegBuffer = new ByteArrayOutputStream(32 * 1024);
+    private int previewSkip = 0;
 
     // ─── UI Components ───────────────────────────────────────
     private JPanel videoPanel;
@@ -84,7 +113,7 @@ public class CameraHostApp extends JFrame {
         updateIPs();
 
         // FPS counter
-        scheduler = Executors.newScheduledThreadPool(2);
+        scheduler = Executors.newScheduledThreadPool(3);
         scheduler.scheduleAtFixedRate(() -> {
             displayFps = fpsCounter.getAndSet(0);
             SwingUtilities.invokeLater(() -> fpsLabel.setText("FPS: " + displayFps));
@@ -392,40 +421,44 @@ public class CameraHostApp extends JFrame {
         portField.setEditable(false);
         resLabel.setText("Res: " + res.width + "x" + res.height);
 
-        // ★ Async broadcast thread — sends latest frame to clients without blocking capture
+        // ★ DIRECT capture + encode + broadcast — ZERO additional delay
         scheduler.submit(() -> {
-            while (streaming.get()) {
-                try {
-                    byte[] frame = latestFrame;
-                    if (frame != null && wsServer != null && !wsServer.getConnections().isEmpty()) {
-                        wsServer.broadcast(frame);
-                    }
-                    Thread.sleep(1000 / targetFps);
-                } catch (InterruptedException e) {
-                    break;
-                } catch (Exception e) {}
-            }
-        });
-
-        // ★ Capture loop — no Thread.sleep, webcam.getImage() already rate-limits
-        scheduler.submit(() -> {
+            long frameInterval = 1000 / targetFps;
             while (streaming.get() && webcam.isOpen()) {
+                long t0 = System.currentTimeMillis();
                 try {
                     BufferedImage frame = webcam.getImage();
                     if (frame == null) continue;
 
-                    // Update preview (every 3rd frame to reduce UI overhead)
-                    if (++previewSkip % 3 == 0) {
+                    // Update preview (every 5th frame — minimize UI overhead)
+                    if (++previewSkip % 5 == 0) {
                         currentFrame = frame;
                         videoPanel.repaint();
                     }
 
-                    // ★ Encode JPEG with reused encoder
+                    // ★ Encode JPEG
                     byte[] jpegData = encodeJpegFast(frame);
-                    if (jpegData != null) {
-                        latestFrame = jpegData;  // Async broadcast picks this up
+                    if (jpegData != null && wsServer != null && !wsServer.getConnections().isEmpty()) {
+                        // ★ Prepend 8-byte timestamp header for latency measurement
+                        long now = System.currentTimeMillis();
+                        byte[] packet = new byte[8 + jpegData.length];
+                        for (int i = 7; i >= 0; i--) {
+                            packet[i] = (byte)(now & 0xFF);
+                            now >>= 8;
+                        }
+                        System.arraycopy(jpegData, 0, packet, 8, jpegData.length);
+
+                        // ★ DIRECT broadcast — no async, no queue, no delay
+                        wsServer.broadcast(packet);
                         fpsCounter.incrementAndGet();
                     }
+
+                    // ★ Precise FPS throttle (only sleep remaining time)
+                    long elapsed = System.currentTimeMillis() - t0;
+                    long sleepMs = frameInterval - elapsed;
+                    if (sleepMs > 2) Thread.sleep(sleepMs);
+                } catch (InterruptedException e) {
+                    break;
                 } catch (Exception e) {
                     // ignore frame errors
                 }
