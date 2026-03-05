@@ -5,14 +5,18 @@ echo   Camera Client - Remote Camera IP
 echo ========================================
 echo.
 
+:: Move to script directory
+pushd "%~dp0"
+
 :: Check if JAR exists, if not build it first
-if not exist "%~dp0build\libs\camera-ip-1.0.0-client.jar" (
+if not exist "build\libs\camera-ip-1.0.0-client.jar" (
     echo [..] Building app for the first time...
     echo.
-    call "%~dp0gradlew.bat" fatJarClient -p "%~dp0" --console=plain
+    call gradlew.bat fatJarClient
     if %ERRORLEVEL% neq 0 (
         echo.
         echo [X] Build failed! Make sure Java JDK 17+ is installed.
+        popd
         pause
         exit /b 1
     )
@@ -21,5 +25,6 @@ if not exist "%~dp0build\libs\camera-ip-1.0.0-client.jar" (
     echo.
 )
 
-java -jar "%~dp0build\libs\camera-ip-1.0.0-client.jar"
+java -jar "build\libs\camera-ip-1.0.0-client.jar"
+popd
 pause
