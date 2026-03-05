@@ -52,6 +52,8 @@ public class CameraClientApp extends JFrame {
     private volatile int displayFps = 0;
     private volatile long lastFrameTime = 0;
     private volatile int frameWidth = 0, frameHeight = 0;
+    private volatile long latencyMs = 0;  // ★ Measured latency
+    private volatile byte[] latestJpegData;  // ★ Latest frame for vcam (avoid queue)
 
     // ─── UI ──────────────────────────────────────────────────
     private JPanel videoPanel;
@@ -71,10 +73,13 @@ public class CameraClientApp extends JFrame {
 
         buildUI();
 
-        scheduler = Executors.newScheduledThreadPool(2);
+        scheduler = Executors.newScheduledThreadPool(4);
         scheduler.scheduleAtFixedRate(() -> {
             displayFps = fpsCounter.getAndSet(0);
-            SwingUtilities.invokeLater(() -> fpsLabel.setText("FPS: " + displayFps));
+            SwingUtilities.invokeLater(() -> {
+                fpsLabel.setText("FPS: " + displayFps);
+                latencyLabel.setText("Latency: " + latencyMs + "ms");
+            });
         }, 1, 1, TimeUnit.SECONDS);
     }
 
@@ -296,19 +301,32 @@ public class CameraClientApp extends JFrame {
                         portField.setEditable(false);
                         vcamButton.setEnabled(true);
                     });
+                    // ★ Start ping for latency measurement
+                    CameraClientApp.this.startPingLoop();
                 }
 
                 @Override
                 public void onMessage(String message) {
-                    // JSON control messages (pong, etc.)
+                    // ★ Handle pong for latency measurement
+                    if (message.contains("\"pong\"") && message.contains("\"time\"")) {
+                        try {
+                            String timeStr = message.replaceAll(".*\"time\":", "").replaceAll("[^0-9]", "");
+                            long serverTime = Long.parseLong(timeStr);
+                            latencyMs = System.currentTimeMillis() - serverTime;
+                        } catch (Exception e) {}
+                    }
                 }
 
                 @Override
                 public void onMessage(ByteBuffer bytes) {
-                    // Binary = JPEG frame
+                    // ★ Binary = JPEG frame — decode and display immediately
                     try {
                         byte[] data = new byte[bytes.remaining()];
                         bytes.get(data);
+
+                        // ★ Store latest JPEG for vcam (non-blocking)
+                        latestJpegData = data;
+
                         BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
                         if (img != null) {
                             currentFrame = img;
@@ -322,11 +340,6 @@ public class CameraClientApp extends JFrame {
                             if (fpsCounter.get() % 30 == 1) {
                                 SwingUtilities.invokeLater(() ->
                                         resLabel.setText("Res: " + frameWidth + "x" + frameHeight));
-                            }
-
-                            // Send to virtual camera if enabled
-                            if (vcamEnabled.get() && vcamOutputStream != null) {
-                                sendFrameToVCam(data);
                             }
                         }
                     } catch (Exception e) {
@@ -360,6 +373,7 @@ public class CameraClientApp extends JFrame {
                 }
             };
             wsClient.setConnectionLostTimeout(30);
+            wsClient.setTcpNoDelay(true);  // ★ Disable Nagle's algorithm
             wsClient.connect();
         } catch (Exception ex) {
             statusLabel.setText("❌ URL sai: " + ex.getMessage());
@@ -382,6 +396,22 @@ public class CameraClientApp extends JFrame {
         portField.setEditable(true);
         vcamButton.setEnabled(false);
         if (vcamEnabled.get()) stopVirtualCamera();
+    }
+
+    /** ★ Ping loop for latency measurement */
+    private void startPingLoop() {
+        scheduler.submit(() -> {
+            while (connected.get()) {
+                try {
+                    if (wsClient != null && wsClient.isOpen()) {
+                        wsClient.send("{\"type\":\"ping\",\"timestamp\":" + System.currentTimeMillis() + "}");
+                    }
+                    Thread.sleep(2000);  // Ping every 2 seconds
+                } catch (Exception e) {
+                    break;
+                }
+            }
+        });
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -429,6 +459,9 @@ public class CameraClientApp extends JFrame {
             vcamProcess = pb.start();
             vcamOutputStream = vcamProcess.getOutputStream();
 
+            // Use BufferedOutputStream for vcam pipe
+            vcamOutputStream = new BufferedOutputStream(vcamProcess.getOutputStream(), 128 * 1024);
+
             // Read stderr/stdout in background
             scheduler.submit(() -> {
                 try (BufferedReader reader = new BufferedReader(
@@ -451,6 +484,21 @@ public class CameraClientApp extends JFrame {
             vcamButton.setBackground(RED);
             vcamStatusLabel.setText("🟢 Đang chạy - Chọn 'OBS Virtual Camera' trong Meet");
             vcamStatusLabel.setForeground(GREEN);
+
+            // ★ VCam feeder thread — sends latest frame to bridge independently
+            scheduler.submit(() -> {
+                while (vcamEnabled.get()) {
+                    try {
+                        byte[] data = latestJpegData;
+                        if (data != null && vcamOutputStream != null) {
+                            sendFrameToVCam(data);
+                        }
+                        Thread.sleep(33); // ~30fps
+                    } catch (InterruptedException e) {
+                        break;
+                    } catch (Exception e) {}
+                }
+            });
 
         } catch (Exception ex) {
             vcamStatusLabel.setText("❌ " + ex.getMessage());
@@ -484,12 +532,11 @@ public class CameraClientApp extends JFrame {
     private void sendFrameToVCam(byte[] jpegData) {
         try {
             if (vcamOutputStream != null) {
-                // Protocol: [4 bytes: length][N bytes: JPEG data]
+                // ★ Protocol: [4 bytes: length (big-endian)][N bytes: JPEG data]
                 int len = jpegData.length;
-                vcamOutputStream.write((len >> 24) & 0xFF);
-                vcamOutputStream.write((len >> 16) & 0xFF);
-                vcamOutputStream.write((len >> 8) & 0xFF);
-                vcamOutputStream.write(len & 0xFF);
+                byte[] header = { (byte)((len >> 24) & 0xFF), (byte)((len >> 16) & 0xFF),
+                                  (byte)((len >> 8) & 0xFF), (byte)(len & 0xFF) };
+                vcamOutputStream.write(header);
                 vcamOutputStream.write(jpegData);
                 vcamOutputStream.flush();
             }

@@ -48,10 +48,16 @@ public class CameraHostApp extends JFrame {
     private FrameServer wsServer;
     private final AtomicBoolean streaming = new AtomicBoolean(false);
     private ScheduledExecutorService scheduler;
-    private int jpegQuality = 70;
+    private int jpegQuality = 50;  // Lower default = less latency
     private int targetFps = 30;
     private final AtomicInteger fpsCounter = new AtomicInteger(0);
     private volatile int displayFps = 0;
+    // Reuse encoder for performance
+    private javax.imageio.ImageWriter jpegWriter;
+    private javax.imageio.ImageWriteParam jpegParam;
+    private final ByteArrayOutputStream jpegBuffer = new ByteArrayOutputStream(64 * 1024);
+    private volatile byte[] latestFrame;  // Latest encoded frame for async broadcast
+    private int previewSkip = 0;  // Skip counter for UI updates
 
     // ─── UI Components ───────────────────────────────────────
     private JPanel videoPanel;
@@ -198,6 +204,10 @@ public class CameraHostApp extends JFrame {
         qualitySlider.addChangeListener(e -> {
             jpegQuality = qualitySlider.getValue();
             qualityValueLabel.setText(jpegQuality + "%");
+            // Update encoder quality in real-time
+            if (jpegParam != null) {
+                jpegParam.setCompressionQuality(jpegQuality / 100f);
+            }
         });
         camCard.add(qualitySlider);
         camCard.setMaximumSize(new Dimension(Integer.MAX_VALUE, camCard.getPreferredSize().height + 20));
@@ -358,6 +368,7 @@ public class CameraHostApp extends JFrame {
         }
         try {
             wsServer = new FrameServer(port);
+            wsServer.setTcpNoDelay(true);     // ★ Disable Nagle's = lower latency
             wsServer.start();
         } catch (Exception ex) {
             statusLabel.setText("❌ Không mở được port: " + ex.getMessage());
@@ -365,6 +376,9 @@ public class CameraHostApp extends JFrame {
             webcam.close();
             return;
         }
+
+        // Init JPEG encoder (reuse for performance)
+        initJpegEncoder();
 
         streaming.set(true);
 
@@ -378,27 +392,40 @@ public class CameraHostApp extends JFrame {
         portField.setEditable(false);
         resLabel.setText("Res: " + res.width + "x" + res.height);
 
-        // Capture loop
+        // ★ Async broadcast thread — sends latest frame to clients without blocking capture
+        scheduler.submit(() -> {
+            while (streaming.get()) {
+                try {
+                    byte[] frame = latestFrame;
+                    if (frame != null && wsServer != null && !wsServer.getConnections().isEmpty()) {
+                        wsServer.broadcast(frame);
+                    }
+                    Thread.sleep(1000 / targetFps);
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {}
+            }
+        });
+
+        // ★ Capture loop — no Thread.sleep, webcam.getImage() already rate-limits
         scheduler.submit(() -> {
             while (streaming.get() && webcam.isOpen()) {
                 try {
                     BufferedImage frame = webcam.getImage();
-                    if (frame == null)
-                        continue;
-                    currentFrame = frame;
-                    videoPanel.repaint();
+                    if (frame == null) continue;
 
-                    // Encode JPEG
-                    byte[] jpegData = encodeJpeg(frame);
-                    if (jpegData != null && wsServer != null) {
-                        wsServer.broadcast(jpegData);
-                        fpsCounter.incrementAndGet();
+                    // Update preview (every 3rd frame to reduce UI overhead)
+                    if (++previewSkip % 3 == 0) {
+                        currentFrame = frame;
+                        videoPanel.repaint();
                     }
 
-                    // Throttle
-                    Thread.sleep(1000 / targetFps);
-                } catch (InterruptedException e) {
-                    break;
+                    // ★ Encode JPEG with reused encoder
+                    byte[] jpegData = encodeJpegFast(frame);
+                    if (jpegData != null) {
+                        latestFrame = jpegData;  // Async broadcast picks this up
+                        fpsCounter.incrementAndGet();
+                    }
                 } catch (Exception e) {
                     // ignore frame errors
                 }
@@ -436,20 +463,27 @@ public class CameraHostApp extends JFrame {
         viewersLabel.setText("👁 Viewers: 0");
     }
 
-    private byte[] encodeJpeg(BufferedImage img) {
+    /** ★ Initialize reusable JPEG encoder */
+    private void initJpegEncoder() {
+        var writers = ImageIO.getImageWritersByFormatName("jpg");
+        if (writers.hasNext()) {
+            jpegWriter = writers.next();
+            jpegParam = jpegWriter.getDefaultWriteParam();
+            jpegParam.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+            jpegParam.setCompressionQuality(jpegQuality / 100f);
+        }
+    }
+
+    /** ★ Fast JPEG encode — reuses writer + pre-allocated buffer */
+    private byte[] encodeJpegFast(BufferedImage img) {
         try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            var writers = ImageIO.getImageWritersByFormatName("jpg");
-            if (!writers.hasNext())
-                return null;
-            var writer = writers.next();
-            var param = writer.getDefaultWriteParam();
-            param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
-            param.setCompressionQuality(jpegQuality / 100f);
-            writer.setOutput(ImageIO.createImageOutputStream(baos));
-            writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
-            writer.dispose();
-            return baos.toByteArray();
+            if (jpegWriter == null) return null;
+            jpegBuffer.reset();
+            var ios = ImageIO.createImageOutputStream(jpegBuffer);
+            jpegWriter.setOutput(ios);
+            jpegWriter.write(null, new javax.imageio.IIOImage(img, null, null), jpegParam);
+            ios.flush();
+            return jpegBuffer.toByteArray();
         } catch (Exception e) {
             return null;
         }
@@ -462,6 +496,7 @@ public class CameraHostApp extends JFrame {
         FrameServer(int port) {
             super(new InetSocketAddress("0.0.0.0", port));
             setReuseAddr(true);
+            setTcpNoDelay(true);  // ★ Disable Nagle's algorithm
         }
 
         @Override
