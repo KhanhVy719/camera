@@ -165,7 +165,7 @@ public class CameraHostApp extends JFrame {
                 super.paintComponent(g);
                 Graphics2D g2 = (Graphics2D) g;
                 g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                        RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                        RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);  // Fast preview
                 if (currentFrame != null) {
                     int pw = getWidth(), ph = getHeight();
                     int iw = currentFrame.getWidth(), ih = currentFrame.getHeight();
@@ -446,7 +446,14 @@ public class CameraHostApp extends JFrame {
                     BufferedImage frame = webcam.getImage();
                     if (frame == null) continue;
 
-                    // ★ Auto-downscale if latency is high (Discord-style)
+                    // ★ Preview shows FULL resolution (smooth, every 2nd frame)
+                    if (++previewSkip % 2 == 0) {
+                        currentFrame = frame;
+                        videoPanel.repaint();
+                    }
+
+                    // ★ Auto-downscale for NETWORK only (not preview)
+                    BufferedImage sendFrame = frame;
                     if (scaleRatio < 0.95) {
                         int nw = (int)(frame.getWidth() * scaleRatio);
                         int nh = (int)(frame.getHeight() * scaleRatio);
@@ -454,21 +461,15 @@ public class CameraHostApp extends JFrame {
                             BufferedImage scaled = new BufferedImage(nw, nh, BufferedImage.TYPE_INT_RGB);
                             Graphics2D g = scaled.createGraphics();
                             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                                    RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR); // Fast
+                                    RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
                             g.drawImage(frame, 0, 0, nw, nh, null);
                             g.dispose();
-                            frame = scaled;
+                            sendFrame = scaled;
                         }
                     }
 
-                    // Update preview
-                    if (++previewSkip % 5 == 0) {
-                        currentFrame = frame;
-                        videoPanel.repaint();
-                    }
-
                     // ★ Encode JPEG with adaptive quality
-                    byte[] jpegData = encodeJpegFast(frame);
+                    byte[] jpegData = encodeJpegFast(sendFrame);
                     if (jpegData != null && wsServer != null && !wsServer.getConnections().isEmpty()) {
                         // Prepend 8-byte timestamp
                         long now = System.currentTimeMillis();
