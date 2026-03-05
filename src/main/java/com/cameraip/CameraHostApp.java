@@ -78,19 +78,25 @@ public class CameraHostApp extends JFrame {
     private FrameServer wsServer;
     private final AtomicBoolean streaming = new AtomicBoolean(false);
     private ScheduledExecutorService scheduler;
-    private int jpegQuality = 40;  // ★ Lower = smaller frame = faster transfer
+    private volatile int jpegQuality = 55;
     private int targetFps = 30;
     private final AtomicInteger fpsCounter = new AtomicInteger(0);
     private volatile int displayFps = 0;
-    // Reuse encoder for performance
+    // Reuse encoder
     private javax.imageio.ImageWriter jpegWriter;
     private javax.imageio.ImageWriteParam jpegParam;
     private final ByteArrayOutputStream jpegBuffer = new ByteArrayOutputStream(32 * 1024);
     private int previewSkip = 0;
 
+    // ★ Adaptive Bitrate Controller (Discord-style)
+    private volatile long clientLatency = 0;  // Latest reported latency from client
+    private volatile double scaleRatio = 1.0; // Resolution scale (1.0 = full, 0.5 = half)
+    private volatile String networkQuality = "✨ Excellent";
+    private Dimension captureResolution;  // Original capture resolution
+
     // ─── UI Components ───────────────────────────────────────
     private JPanel videoPanel;
-    private JLabel statusLabel, fpsLabel, resLabel, viewersLabel;
+    private JLabel statusLabel, fpsLabel, resLabel, viewersLabel, qualityAutoLabel;
     private JComboBox<String> cameraCombo, resolutionCombo;
     private JSlider qualitySlider;
     private JLabel qualityValueLabel;
@@ -113,10 +119,13 @@ public class CameraHostApp extends JFrame {
         updateIPs();
 
         // FPS counter
-        scheduler = Executors.newScheduledThreadPool(3);
+        scheduler = Executors.newScheduledThreadPool(4);
         scheduler.scheduleAtFixedRate(() -> {
             displayFps = fpsCounter.getAndSet(0);
-            SwingUtilities.invokeLater(() -> fpsLabel.setText("FPS: " + displayFps));
+            SwingUtilities.invokeLater(() -> {
+                fpsLabel.setText("FPS: " + displayFps);
+                qualityAutoLabel.setText("Q:" + jpegQuality + "% S:" + (int)(scaleRatio*100) + "% | " + networkQuality);
+            });
         }, 1, 1, TimeUnit.SECONDS);
     }
 
@@ -184,8 +193,10 @@ public class CameraHostApp extends JFrame {
         fpsLabel = makeStatLabel("FPS: --", GREEN);
         resLabel = makeStatLabel("Res: --", FG_DIM);
         viewersLabel = makeStatLabel("👁 Viewers: 0", ACCENT);
+        qualityAutoLabel = makeStatLabel("Adaptive: --", YELLOW);
         statsBar.add(fpsLabel);
         statsBar.add(resLabel);
+        statsBar.add(qualityAutoLabel);
         statsBar.add(Box.createHorizontalGlue());
         statsBar.add(viewersLabel);
         videoCard.add(statsBar, BorderLayout.SOUTH);
@@ -408,6 +419,8 @@ public class CameraHostApp extends JFrame {
 
         // Init JPEG encoder (reuse for performance)
         initJpegEncoder();
+        captureResolution = res;
+        scaleRatio = 1.0;
 
         streaming.set(true);
 
@@ -421,7 +434,10 @@ public class CameraHostApp extends JFrame {
         portField.setEditable(false);
         resLabel.setText("Res: " + res.width + "x" + res.height);
 
-        // ★ DIRECT capture + encode + broadcast — ZERO additional delay
+        // ★ Adaptive bitrate controller (runs every 500ms)
+        scheduler.scheduleAtFixedRate(this::adaptiveBitrateControl, 1000, 500, TimeUnit.MILLISECONDS);
+
+        // ★ DIRECT capture + encode + broadcast
         scheduler.submit(() -> {
             long frameInterval = 1000 / targetFps;
             while (streaming.get() && webcam.isOpen()) {
@@ -430,16 +446,31 @@ public class CameraHostApp extends JFrame {
                     BufferedImage frame = webcam.getImage();
                     if (frame == null) continue;
 
-                    // Update preview (every 5th frame — minimize UI overhead)
+                    // ★ Auto-downscale if latency is high (Discord-style)
+                    if (scaleRatio < 0.95) {
+                        int nw = (int)(frame.getWidth() * scaleRatio);
+                        int nh = (int)(frame.getHeight() * scaleRatio);
+                        if (nw > 160 && nh > 120) {
+                            BufferedImage scaled = new BufferedImage(nw, nh, BufferedImage.TYPE_INT_RGB);
+                            Graphics2D g = scaled.createGraphics();
+                            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                                    RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR); // Fast
+                            g.drawImage(frame, 0, 0, nw, nh, null);
+                            g.dispose();
+                            frame = scaled;
+                        }
+                    }
+
+                    // Update preview
                     if (++previewSkip % 5 == 0) {
                         currentFrame = frame;
                         videoPanel.repaint();
                     }
 
-                    // ★ Encode JPEG
+                    // ★ Encode JPEG with adaptive quality
                     byte[] jpegData = encodeJpegFast(frame);
                     if (jpegData != null && wsServer != null && !wsServer.getConnections().isEmpty()) {
-                        // ★ Prepend 8-byte timestamp header for latency measurement
+                        // Prepend 8-byte timestamp
                         long now = System.currentTimeMillis();
                         byte[] packet = new byte[8 + jpegData.length];
                         for (int i = 7; i >= 0; i--) {
@@ -447,20 +478,18 @@ public class CameraHostApp extends JFrame {
                             now >>= 8;
                         }
                         System.arraycopy(jpegData, 0, packet, 8, jpegData.length);
-
-                        // ★ DIRECT broadcast — no async, no queue, no delay
                         wsServer.broadcast(packet);
                         fpsCounter.incrementAndGet();
                     }
 
-                    // ★ Precise FPS throttle (only sleep remaining time)
+                    // Precise FPS throttle
                     long elapsed = System.currentTimeMillis() - t0;
                     long sleepMs = frameInterval - elapsed;
                     if (sleepMs > 2) Thread.sleep(sleepMs);
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
-                    // ignore frame errors
+                    // ignore
                 }
             }
         });
@@ -546,9 +575,16 @@ public class CameraHostApp extends JFrame {
 
         @Override
         public void onMessage(WebSocket conn, String message) {
-            // Handle control messages (ping/pong)
+            // ★ Handle control messages
             if (message.contains("\"ping\"")) {
                 conn.send("{\"type\":\"pong\",\"time\":" + System.currentTimeMillis() + "}");
+            }
+            // ★ Handle latency report from client (Discord-style feedback)
+            if (message.contains("\"latency_report\"")) {
+                try {
+                    String latStr = message.replaceAll(".*\"latency\":", "").replaceAll("[^0-9]", "");
+                    clientLatency = Long.parseLong(latStr);
+                } catch (Exception e) {}
             }
         }
 
@@ -566,6 +602,56 @@ public class CameraHostApp extends JFrame {
             int count = getConnections().size();
             SwingUtilities.invokeLater(() -> viewersLabel.setText("👁 Viewers: " + count));
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // ★ ADAPTIVE BITRATE CONTROLLER (Discord-style)
+    // ═════════════════════════════════════════════════════════════
+    private void adaptiveBitrateControl() {
+        if (!streaming.get()) return;
+        long lat = clientLatency;
+        if (lat <= 0) return;  // No data yet
+
+        // ★ Adjust quality based on latency thresholds (like Discord)
+        if (lat < 50) {
+            // Excellent connection — increase quality gradually
+            jpegQuality = Math.min(80, jpegQuality + 3);
+            scaleRatio = Math.min(1.0, scaleRatio + 0.05);
+            networkQuality = "✨ Excellent";
+        } else if (lat < 100) {
+            // Good — slight increase
+            jpegQuality = Math.min(65, jpegQuality + 1);
+            scaleRatio = Math.min(1.0, scaleRatio + 0.02);
+            networkQuality = "✅ Good";
+        } else if (lat < 150) {
+            // Fair — hold steady
+            networkQuality = "⚠️ Fair";
+        } else if (lat < 250) {
+            // Poor — decrease quality
+            jpegQuality = Math.max(25, jpegQuality - 3);
+            networkQuality = "🟡 Poor";
+        } else if (lat < 500) {
+            // Bad — aggressive quality reduction + downscale
+            jpegQuality = Math.max(20, jpegQuality - 5);
+            scaleRatio = Math.max(0.5, scaleRatio - 0.1);
+            networkQuality = "🔴 Bad";
+        } else {
+            // Critical — minimum everything
+            jpegQuality = 20;
+            scaleRatio = 0.4;
+            networkQuality = "❌ Critical";
+        }
+
+        // Update encoder with new quality
+        if (jpegParam != null) {
+            jpegParam.setCompressionQuality(jpegQuality / 100f);
+        }
+
+        // Update slider to reflect auto-adjusted quality
+        SwingUtilities.invokeLater(() -> {
+            qualitySlider.setValue(jpegQuality);
+            qualityValueLabel.setText(jpegQuality + "% (auto)");
+        });
     }
 
     // ═══════════════════════════════════════════════════════════

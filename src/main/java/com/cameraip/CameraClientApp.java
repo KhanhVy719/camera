@@ -445,15 +445,20 @@ public class CameraClientApp extends JFrame {
         if (vcamEnabled.get()) stopVirtualCamera();
     }
 
-    /** ★ Ping loop for latency measurement */
+    /** ★ Latency reporting loop — sends latency back to Host for adaptive bitrate */
     private void startPingLoop() {
         scheduler.submit(() -> {
             while (connected.get()) {
                 try {
                     if (wsClient != null && wsClient.isOpen()) {
+                        // Send ping for pong-based latency
                         wsClient.send("{\"type\":\"ping\",\"timestamp\":" + System.currentTimeMillis() + "}");
+                        // ★ Report measured latency to Host (for adaptive bitrate)
+                        if (latencyMs > 0) {
+                            wsClient.send("{\"type\":\"latency_report\",\"latency\":" + latencyMs + "}");
+                        }
                     }
-                    Thread.sleep(2000);  // Ping every 2 seconds
+                    Thread.sleep(500);  // Report every 500ms (Discord-like frequency)
                 } catch (Exception e) {
                     break;
                 }
