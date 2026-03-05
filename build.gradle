@@ -1,0 +1,68 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.cameraip'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Webcam capture
+    implementation 'com.github.sarxos:webcam-capture:0.3.12'
+
+    // WebSocket
+    implementation 'org.java-websocket:Java-WebSocket:1.5.7'
+
+    // Modern Swing Look & Feel
+    implementation 'com.formdev:flatlaf:3.5.4'
+}
+
+// Run Camera Host
+tasks.register('runHost', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.cameraip.CameraHostApp'
+}
+
+// Run Camera Client
+tasks.register('runClient', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.cameraip.CameraClientApp'
+}
+
+application {
+    mainClass = 'com.cameraip.CameraHostApp'
+}
+
+// Fat JAR for easy distribution
+tasks.register('fatJarHost', Jar) {
+    archiveClassifier = 'host'
+    manifest {
+        attributes 'Main-Class': 'com.cameraip.CameraHostApp'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    with jar
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register('fatJarClient', Jar) {
+    archiveClassifier = 'client'
+    manifest {
+        attributes 'Main-Class': 'com.cameraip.CameraClientApp'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    with jar
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
