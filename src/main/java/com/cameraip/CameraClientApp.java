@@ -18,13 +18,8 @@ import java.awt.event.FocusEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.concurrent.Executors;
@@ -78,14 +73,11 @@ public class CameraClientApp extends JFrame {
 
     // ─── State ───────────────────────────────────────────────
     private WebSocketClient wsClient;
-    private Process vcamProcess;
-    private OutputStream vcamOutputStream;
     private final AtomicBoolean connected = new AtomicBoolean(false);
     private final AtomicBoolean vcamEnabled = new AtomicBoolean(false);
     private ScheduledExecutorService scheduler;
     private final AtomicInteger fpsCounter = new AtomicInteger(0);
     private volatile int displayFps = 0;
-    private volatile long lastFrameTime = 0;
     private volatile int frameWidth = 0, frameHeight = 0;
     private volatile long latencyMs = 0;  // ★ Measured latency
     private volatile byte[] latestJpegData;  // ★ Latest frame for vcam (avoid queue)
@@ -380,7 +372,6 @@ public class CameraClientApp extends JFrame {
                             frameWidth = img.getWidth();
                             frameHeight = img.getHeight();
                             fpsCounter.incrementAndGet();
-                            lastFrameTime = System.currentTimeMillis();
                             videoPanel.repaint();
 
                             // Update resolution label occasionally
@@ -467,8 +458,10 @@ public class CameraClientApp extends JFrame {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  VIRTUAL CAMERA (via Python bridge)
+    //  VIRTUAL CAMERA (Java — direct OBS shared memory via JNA)
     // ═══════════════════════════════════════════════════════════
+    private VirtualCamera virtualCamera;
+
     private void toggleVirtualCamera() {
         if (!vcamEnabled.get()) {
             startVirtualCamera();
@@ -484,52 +477,9 @@ public class CameraClientApp extends JFrame {
             return;
         }
 
-        // Find vcam_bridge.py
-        String bridgePath = findVCamBridge();
-        if (bridgePath == null) {
-            vcamStatusLabel.setText("❌ Không tìm thấy vcam_bridge.py");
-            vcamStatusLabel.setForeground(RED);
-            JOptionPane.showMessageDialog(this,
-                    "Không tìm thấy file vcam_bridge.py!\n" +
-                    "File này cần nằm cùng thư mục với ứng dụng.\n\n" +
-                    "Ngoài ra cần:\n" +
-                    "- Python 3 đã cài\n" +
-                    "- pip install pyvirtualcam opencv-python\n" +
-                    "- OBS Studio đã cài (cho Virtual Camera driver)",
-                    "Virtual Camera Setup", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                    "python", bridgePath,
-                    "--width", String.valueOf(frameWidth),
-                    "--height", String.valueOf(frameHeight),
-                    "--fps", "30"
-            );
-            pb.redirectErrorStream(true);
-            vcamProcess = pb.start();
-            vcamOutputStream = vcamProcess.getOutputStream();
-
-            // Use BufferedOutputStream for vcam pipe
-            vcamOutputStream = new BufferedOutputStream(vcamProcess.getOutputStream(), 128 * 1024);
-
-            // Read stderr/stdout in background
-            scheduler.submit(() -> {
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(vcamProcess.getInputStream()))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        System.out.println("[VCam Bridge] " + line);
-                    }
-                } catch (IOException e) {}
-            });
-
-            // Check if process is alive after a short delay
-            Thread.sleep(500);
-            if (!vcamProcess.isAlive()) {
-                throw new RuntimeException("Bridge process exited immediately. Check Python/pyvirtualcam installation.");
-            }
+            // ★ Create Java virtual camera (writes to OBS shared memory)
+            virtualCamera = new VirtualCamera(frameWidth, frameHeight, 30);
 
             vcamEnabled.set(true);
             vcamButton.setText("⏹  Tắt Virtual Camera");
@@ -537,18 +487,23 @@ public class CameraClientApp extends JFrame {
             vcamStatusLabel.setText("🟢 Đang chạy - Chọn 'OBS Virtual Camera' trong Meet");
             vcamStatusLabel.setForeground(GREEN);
 
-            // ★ VCam feeder thread — sends latest frame to bridge independently
+            // ★ VCam feeder thread — decodes JPEG and writes to shared memory
             scheduler.submit(() -> {
                 while (vcamEnabled.get()) {
                     try {
                         byte[] data = latestJpegData;
-                        if (data != null && vcamOutputStream != null) {
-                            sendFrameToVCam(data);
+                        if (data != null && virtualCamera != null && virtualCamera.isActive()) {
+                            BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
+                            if (img != null) {
+                                virtualCamera.writeFrame(img);
+                            }
                         }
                         Thread.sleep(33); // ~30fps
                     } catch (InterruptedException e) {
                         break;
-                    } catch (Exception e) {}
+                    } catch (Exception e) {
+                        // ignore frame errors
+                    }
                 }
             });
 
@@ -558,58 +513,23 @@ public class CameraClientApp extends JFrame {
             JOptionPane.showMessageDialog(this,
                     "Không thể khởi động Virtual Camera:\n" + ex.getMessage() +
                     "\n\nKiểm tra:\n" +
-                    "1. Python 3 đã cài và nằm trong PATH\n" +
-                    "2. Đã chạy: pip install pyvirtualcam\n" +
-                    "3. OBS Studio đã cài (cho driver)",
+                    "1. OBS Studio đã cài (cho driver Virtual Camera)\n" +
+                    "2. Không có ứng dụng khác đang dùng OBS Virtual Camera\n" +
+                    "3. Thử tắt OBS nếu đang mở",
                     "Virtual Camera Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
     private void stopVirtualCamera() {
         vcamEnabled.set(false);
-        if (vcamOutputStream != null) {
-            try { vcamOutputStream.close(); } catch (IOException e) {}
-            vcamOutputStream = null;
-        }
-        if (vcamProcess != null) {
-            vcamProcess.destroyForcibly();
-            vcamProcess = null;
+        if (virtualCamera != null) {
+            virtualCamera.close();
+            virtualCamera = null;
         }
         vcamButton.setText("📷  Bật Virtual Camera");
         vcamButton.setBackground(PURPLE);
         vcamStatusLabel.setText("⏸ Tắt");
         vcamStatusLabel.setForeground(FG_DIM);
-    }
-
-    private void sendFrameToVCam(byte[] jpegData) {
-        try {
-            if (vcamOutputStream != null) {
-                // ★ Protocol: [4 bytes: length (big-endian)][N bytes: JPEG data]
-                int len = jpegData.length;
-                byte[] header = { (byte)((len >> 24) & 0xFF), (byte)((len >> 16) & 0xFF),
-                                  (byte)((len >> 8) & 0xFF), (byte)(len & 0xFF) };
-                vcamOutputStream.write(header);
-                vcamOutputStream.write(jpegData);
-                vcamOutputStream.flush();
-            }
-        } catch (IOException e) {
-            // Bridge died, disable vcam
-            SwingUtilities.invokeLater(this::stopVirtualCamera);
-        }
-    }
-
-    private String findVCamBridge() {
-        // Search for vcam_bridge.py in common locations
-        String[] paths = {
-                "vcam_bridge.py",
-                System.getProperty("user.dir") + File.separator + "vcam_bridge.py",
-                new File(CameraClientApp.class.getProtectionDomain().getCodeSource()
-                        .getLocation().getPath()).getParent() + File.separator + "vcam_bridge.py",
-        };
-        for (String p : paths) {
-            if (new File(p).exists()) return new File(p).getAbsolutePath();
-        }
-        return null;
     }
 
     // ═══════════════════════════════════════════════════════════

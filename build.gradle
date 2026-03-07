@@ -24,6 +24,10 @@ dependencies {
 
     // Modern Swing Look & Feel
     implementation 'com.formdev:flatlaf:3.5.4'
+
+    // JNA for Windows API (Virtual Camera shared memory)
+    implementation 'net.java.dev.jna:jna:5.14.0'
+    implementation 'net.java.dev.jna:jna-platform:5.14.0'
 }
 
 // Run Camera Host
