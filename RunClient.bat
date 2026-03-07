@@ -25,6 +25,5 @@ if not exist "build\libs\camera-ip-1.0.0-client.jar" (
     echo.
 )
 
-java -jar "build\libs\camera-ip-1.0.0-client.jar"
+start "" javaw -jar "build\libs\camera-ip-1.0.0-client.jar"
 popd
-pause
