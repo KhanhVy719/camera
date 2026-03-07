@@ -91,7 +91,7 @@ public class CameraClientApp extends JFrame {
 
     public CameraClientApp() {
         super("🖥 Camera Client - Remote Camera IP");
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setSize(950, 700);
         setMinimumSize(new Dimension(800, 600));
         setLocationRelativeTo(null);
@@ -99,6 +99,19 @@ public class CameraClientApp extends JFrame {
         setLayout(new BorderLayout());
 
         buildUI();
+        setupSystemTray();
+
+        // Handle window close → minimize to tray
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                if (java.awt.SystemTray.isSupported() && (connected.get() || vcamEnabled.get())) {
+                    setVisible(false); // minimize to tray
+                } else {
+                    exitApp(); // no tray or nothing running → exit
+                }
+            }
+        });
 
         scheduler = Executors.newScheduledThreadPool(4);
         scheduler.scheduleAtFixedRate(() -> {
@@ -108,6 +121,68 @@ public class CameraClientApp extends JFrame {
                 latencyLabel.setText("Latency: " + latencyMs + "ms");
             });
         }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SYSTEM TRAY (chạy nền khi đóng cửa sổ)
+    // ═══════════════════════════════════════════════════════════
+    private java.awt.TrayIcon trayIcon;
+
+    private void setupSystemTray() {
+        if (!java.awt.SystemTray.isSupported()) return;
+        try {
+            java.awt.SystemTray tray = java.awt.SystemTray.getSystemTray();
+
+            // Create simple icon (16x16 green circle)
+            BufferedImage icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D g = icon.createGraphics();
+            g.setColor(GREEN);
+            g.fillOval(2, 2, 12, 12);
+            g.dispose();
+
+            java.awt.PopupMenu popup = new java.awt.PopupMenu();
+
+            java.awt.MenuItem showItem = new java.awt.MenuItem("Mở Camera Client");
+            showItem.addActionListener(e -> {
+                setVisible(true);
+                setExtendedState(JFrame.NORMAL);
+                toFront();
+            });
+
+            java.awt.MenuItem statusItem = new java.awt.MenuItem("Đang chạy nền...");
+            statusItem.setEnabled(false);
+
+            java.awt.MenuItem exitItem = new java.awt.MenuItem("Thoát");
+            exitItem.addActionListener(e -> exitApp());
+
+            popup.add(statusItem);
+            popup.addSeparator();
+            popup.add(showItem);
+            popup.add(exitItem);
+
+            trayIcon = new java.awt.TrayIcon(icon, "Camera Client - Đang chạy", popup);
+            trayIcon.setImageAutoSize(true);
+            trayIcon.addActionListener(e -> {
+                setVisible(true);
+                setExtendedState(JFrame.NORMAL);
+                toFront();
+            });
+
+            tray.add(trayIcon);
+        } catch (Exception e) {
+            System.err.println("System tray not available: " + e.getMessage());
+        }
+    }
+
+    private void exitApp() {
+        disconnect();
+        if (vcamEnabled.get()) stopVirtualCamera();
+        if (scheduler != null) scheduler.shutdownNow();
+        if (trayIcon != null) {
+            java.awt.SystemTray.getSystemTray().remove(trayIcon);
+        }
+        dispose();
+        System.exit(0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -695,8 +770,6 @@ public class CameraClientApp extends JFrame {
 
     @Override
     public void dispose() {
-        disconnect();
-        if (scheduler != null) scheduler.shutdownNow();
         super.dispose();
     }
 }
