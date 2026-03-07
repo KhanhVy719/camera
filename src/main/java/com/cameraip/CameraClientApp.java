@@ -458,9 +458,11 @@ public class CameraClientApp extends JFrame {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  VIRTUAL CAMERA (Java — direct OBS shared memory via JNA)
+    //  VIRTUAL CAMERA (MJPEG server → OBS Media Source)
     // ═══════════════════════════════════════════════════════════
-    private VirtualCamera virtualCamera;
+    private com.sun.net.httpserver.HttpServer mjpegServer;
+    private static final int MJPEG_PORT = 4747;
+    private static final String MJPEG_BOUNDARY = "--jpgboundary";
 
     private void toggleVirtualCamera() {
         if (!vcamEnabled.get()) {
@@ -478,53 +480,79 @@ public class CameraClientApp extends JFrame {
         }
 
         try {
-            // ★ Create Java virtual camera (writes to OBS shared memory)
-            virtualCamera = new VirtualCamera(frameWidth, frameHeight, 30);
+            // ★ Start MJPEG HTTP server on localhost
+            mjpegServer = com.sun.net.httpserver.HttpServer.create(
+                    new java.net.InetSocketAddress("0.0.0.0", MJPEG_PORT), 0);
 
-            vcamEnabled.set(true);
-            vcamButton.setText("⏹  Tắt Virtual Camera");
-            vcamButton.setBackground(RED);
-            vcamStatusLabel.setText("🟢 Đang chạy - Chọn 'OBS Virtual Camera' trong Meet");
-            vcamStatusLabel.setForeground(GREEN);
+            mjpegServer.createContext("/stream", exchange -> {
+                exchange.getResponseHeaders().set("Content-Type",
+                        "multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY);
+                exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                exchange.sendResponseHeaders(200, 0);
 
-            // ★ VCam feeder thread — decodes JPEG and writes to shared memory
-            scheduler.submit(() -> {
-                while (vcamEnabled.get()) {
-                    try {
-                        byte[] data = latestJpegData;
-                        if (data != null && virtualCamera != null && virtualCamera.isActive()) {
-                            BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
-                            if (img != null) {
-                                virtualCamera.writeFrame(img);
-                            }
+                java.io.OutputStream out = exchange.getResponseBody();
+                System.out.println("[MJPEG] Client connected: " + exchange.getRemoteAddress());
+
+                try {
+                    while (vcamEnabled.get()) {
+                        byte[] jpeg = latestJpegData;
+                        if (jpeg != null) {
+                            String header = MJPEG_BOUNDARY + "\r\n" +
+                                    "Content-Type: image/jpeg\r\n" +
+                                    "Content-Length: " + jpeg.length + "\r\n\r\n";
+                            out.write(header.getBytes());
+                            out.write(jpeg);
+                            out.write("\r\n".getBytes());
+                            out.flush();
                         }
                         Thread.sleep(33); // ~30fps
-                    } catch (InterruptedException e) {
-                        break;
-                    } catch (Exception e) {
-                        // ignore frame errors
                     }
+                } catch (Exception e) {
+                    // Client disconnected
+                    System.out.println("[MJPEG] Client disconnected");
                 }
             });
+
+            mjpegServer.setExecutor(scheduler);
+            mjpegServer.start();
+
+            vcamEnabled.set(true);
+            vcamButton.setText("⏹  Tắt MJPEG Server");
+            vcamButton.setBackground(RED);
+            vcamStatusLabel.setText("🟢 MJPEG: http://localhost:" + MJPEG_PORT + "/stream");
+            vcamStatusLabel.setForeground(GREEN);
+
+            System.out.println("[MJPEG] Server started on port " + MJPEG_PORT);
+            System.out.println("[MJPEG] URL: http://localhost:" + MJPEG_PORT + "/stream");
+            System.out.println("[MJPEG] → Mở OBS → Sources → + Media Source");
+            System.out.println("[MJPEG]   Uncheck 'Local File'");
+            System.out.println("[MJPEG]   Input: http://localhost:" + MJPEG_PORT + "/stream");
+            System.out.println("[MJPEG] → Start Virtual Camera trong OBS");
+
+            // Show instructions
+            JOptionPane.showMessageDialog(this,
+                    "MJPEG Server đang chạy!\n\n" +
+                    "Trong OBS Studio:\n" +
+                    "1. Sources → + → Media Source\n" +
+                    "2. Bỏ tick 'Local File'\n" +
+                    "3. Input URL: http://localhost:" + MJPEG_PORT + "/stream\n" +
+                    "4. Bấm OK → Start Virtual Camera\n" +
+                    "5. Trong Meet chọn 'OBS Virtual Camera'",
+                    "📡 MJPEG Server", JOptionPane.INFORMATION_MESSAGE);
 
         } catch (Exception ex) {
             vcamStatusLabel.setText("❌ " + ex.getMessage());
             vcamStatusLabel.setForeground(RED);
-            JOptionPane.showMessageDialog(this,
-                    "Không thể khởi động Virtual Camera:\n" + ex.getMessage() +
-                    "\n\nKiểm tra:\n" +
-                    "1. OBS Studio đã cài (cho driver Virtual Camera)\n" +
-                    "2. Không có ứng dụng khác đang dùng OBS Virtual Camera\n" +
-                    "3. Thử tắt OBS nếu đang mở",
-                    "Virtual Camera Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
     private void stopVirtualCamera() {
         vcamEnabled.set(false);
-        if (virtualCamera != null) {
-            virtualCamera.close();
-            virtualCamera = null;
+        if (mjpegServer != null) {
+            mjpegServer.stop(0);
+            mjpegServer = null;
+            System.out.println("[MJPEG] Server stopped");
         }
         vcamButton.setText("📷  Bật Virtual Camera");
         vcamButton.setBackground(PURPLE);
