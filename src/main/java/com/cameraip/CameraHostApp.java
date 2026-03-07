@@ -572,6 +572,10 @@ public class CameraHostApp extends JFrame {
         public void onClose(WebSocket conn, int code, String reason, boolean remote) {
             System.out.println("❌ Client disconnected: " + conn.getRemoteSocketAddress());
             updateViewerCount();
+            // ★ Reset latency khi không còn viewer → adaptive controller sẽ reset quality
+            if (getConnections().isEmpty()) {
+                clientLatency = 0;
+            }
         }
 
         @Override
@@ -610,6 +614,20 @@ public class CameraHostApp extends JFrame {
     // ═════════════════════════════════════════════════════════════
     private void adaptiveBitrateControl() {
         if (!streaming.get()) return;
+
+        // ★ Reset to defaults when no viewers connected
+        if (wsServer == null || wsServer.getConnections().isEmpty()) {
+            jpegQuality = 55;
+            scaleRatio = 1.0;
+            networkQuality = "⏸ No viewers";
+            if (jpegParam != null) jpegParam.setCompressionQuality(jpegQuality / 100f);
+            SwingUtilities.invokeLater(() -> {
+                qualitySlider.setValue(jpegQuality);
+                qualityValueLabel.setText(jpegQuality + "%");
+            });
+            return;
+        }
+
         long lat = clientLatency;
         if (lat <= 0) return;  // No data yet
 
